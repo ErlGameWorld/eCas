@@ -1,0 +1,11 @@
+{application, eCas, [
+	{description, "Data cache and storage layer for game servers"},
+	{vsn, "0.1.0"},
+	{registered, [eCas_sup]},
+	{mod, {eCas_app, []}},
+	{applications, [kernel, stdlib, eGLock, ePgdb, eMysql]},
+	{env, []},
+	{modules, []},
+	{licenses, ["MIT"]},
+	{links, []}
+]}.
