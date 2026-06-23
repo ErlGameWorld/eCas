@@ -254,9 +254,12 @@ insert(Table, Key, Data) ->
 	try
 		true = eGLock:tryLock(LockKey),
 		?CASE(IsCacheTable, doCacheInsert(Table, Key, Data), doPlainInsert(Table, Key, Data))
-	catch C:R:S ->
-		error_logger:error_msg("[eCas] put error table=~p key=~p error=~0p~n", [Table, Key, {C, R, S}]),
-		{error, {put_error, {C, R, S}}}
+	catch
+		throw:{error, Reason} ->
+			{error, Reason};
+		C:R:S ->
+			error_logger:error_msg("[eCas] put error table=~p key=~p error=~0p~n", [Table, Key, {C, R, S}]),
+			{error, {insert_error, {C, R, S}}}
 	after
 		eGLock:releaseLock(LockKey)
 	end.
@@ -325,9 +328,12 @@ create(Table, Key, Data) ->
 	try
 		true = eGLock:tryLock(LockKey),
 		?CASE(IsCacheTable, doCacheCreate(Table, Key, Data), doPlainCreate(Table, Key, Data))
-	catch C:R:S ->
-		error_logger:error_msg("[eCas] insert error table=~p key=~p error=~0p~n", [Table, Key, {C, R, S}]),
-		{error, {insert_error, {C, R, S}}}
+	catch
+		throw:{error, Reason} ->
+			{error, Reason};
+		C:R:S ->
+			error_logger:error_msg("[eCas] insert error table=~p key=~p error=~0p~n", [Table, Key, {C, R, S}]),
+			{error, {insert_error, {C, R, S}}}
 	after
 		eGLock:releaseLock(LockKey)
 	end.
@@ -368,7 +374,7 @@ doPlainCreate(Table, _Key, Data) ->
 %%% ===================================================================
 %%% delete(Table, Key) -> ok
 %%%
-%%% 删除记录。hotData 标记为 del 延迟落盘；whole 已落盘记录立即删库。
+%%% 删除记录。hotData / whole 均标记为 del，由 flush 落盘时删库。
 %%% ===================================================================
 -spec delete(atom(), term()) -> ok | {error, term()}.
 delete(Table, Key) ->
@@ -584,7 +590,7 @@ flush(Table) ->
 %%%
 %%% 同步落盘所有缓存表。
 %%% ===================================================================
--spec flushSync() -> ok.
+-spec flushSync() -> ok | {error, [{atom(), term()}]}.
 flushSync() ->
 	Results = [{Table, flushSync(Table)} || Table <- getCacheTables()],
 	case [{Table, Reason} || {Table, {error, Reason}} <- Results] of
@@ -741,7 +747,9 @@ txn(TxnKeys, Fun, Args, TimeOut) when is_function(Fun, 2) ->
 				eGLock:releaseLock(TxnKeyIxs)
 			end;
 		lockTimeout ->
-			{error, {lock_timeout, TxnKeys}}
+			{error, {lock_timeout, TxnKeys}};
+		Other ->
+			{error, {lock_failed, Other, TxnKeys}}
 	end.
 
 buildTxnValues([], ValueAcc, StatusAcc) ->
@@ -1108,21 +1116,25 @@ minsert(Table, DataList) ->
 mupdate(_Table, []) ->
 	ok;
 mupdate(Table, ChangesList) ->
-	TxnKeys = [{Table, Key} || {Key, _Changes} <- ChangesList],
-	txn(TxnKeys, fun(InChangesList, TxnValues) ->
-		{Errors, Alters} = lists:foldl(fun({{_Table, Key}, Value}, {ErrAcc, AlterAcc}) ->
-			Changes = proplists:get_value(Key, InChangesList),
-			case txnUpdateData(Table, Key, Value) of
-				{ok, Data} ->
-					NewData = applyChanges(Table, Data, Changes),
-					{ErrAcc, [{{Table, Key}, NewData} | AlterAcc]};
-				{error, Reason} ->
-					{[{Key, Reason} | ErrAcc], AlterAcc}
-			end
-		end, {[], []}, TxnValues),
-		Ret = ?CASE(Errors, [], ok, _, {error, lists:reverse(Errors)}),
-		{alterTab, Ret, lists:reverse(Alters)}
-	end, ChangesList).
+	?CASE(isCacheTable(Table),
+		begin
+			TxnKeys = [{Table, Key} || {Key, _Changes} <- ChangesList],
+			txn(TxnKeys, fun(InChangesList, TxnValues) ->
+				{Errors, Alters} = lists:foldl(fun({{_Table, Key}, Value}, {ErrAcc, AlterAcc}) ->
+					Changes = proplists:get_value(Key, InChangesList),
+					case txnUpdateData(Table, Key, Value) of
+						{ok, Data} ->
+							NewData = applyChanges(Table, Data, Changes),
+							{ErrAcc, [{{Table, Key}, NewData} | AlterAcc]};
+						{error, Reason} ->
+							{[{Key, Reason} | ErrAcc], AlterAcc}
+					end
+				end, {[], []}, TxnValues),
+				Ret = ?CASE(Errors, [], ok, _, {error, lists:reverse(Errors)}),
+				{alterTab, Ret, lists:reverse(Alters)}
+			end, ChangesList)
+		end,
+		{error, not_cache_table}).
 
 txnUpdateData(Table, _Key, Value) ->
 	case {isCacheTable(Table), Value} of
@@ -1190,7 +1202,7 @@ toMap(L) when is_list(L) -> maps:from_list(L).
 validateCacheKey(Table, Key, Data) ->
 	case cacheTabDef:keyValue(Table, Data) of
 		Key -> ok;
-		DataKey -> error({key_mismatch, Table, Key, DataKey})
+		DataKey -> throw({error, {key_mismatch, Table, Key, DataKey}})
 	end.
 
 dirtyMaskToFields(Table, Mask) when is_integer(Mask) ->

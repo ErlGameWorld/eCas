@@ -87,6 +87,15 @@ create2_and_put2_cache_api_test() ->
 		cleanup(players)
 	end.
 
+insert_key_mismatch_returns_flat_error_test() ->
+	setup_tables(players),
+	try
+		Row = #{id => 99, account => <<"mismatch">>, level => 1, gold => 0, profile => #{}, created_at => <<>>},
+		?assertEqual({error, {key_mismatch, players, 100, 99}}, eCas:insert(players, 100, Row))
+	after
+		cleanup(players)
+	end.
+
 update_dirty_tracks_fields_test() ->
 	setup_tables(items),
 	try

@@ -111,15 +111,15 @@ handleCall(eReload, #state{table = Table, dbMod = DbMod, config = Config} = Stat
 handleCall({eReload, Key}, #state{table = Table, dbMod = DbMod, config = Config} = State, _From) ->
 	LockKey = {Table, Key},
 	Result = try
-				 true = eGLock:tryLock(LockKey),
-				 reloadKey(Table, Key, DbMod, Config)
-			 catch
-				 C:R:S ->
-					 error_logger:error_msg("[csTabSrv] op=reload_key_lock table=~p key=~p reason=~0p~n", [Table, Key, {C, R, S}]),
-					 {error, {LockKey, {C, R, S}}}
-			 after
-				 eGLock:releaseLock(LockKey)
-			 end,
+		true = eGLock:tryLock(LockKey),
+		reloadKey(Table, Key, DbMod, Config)
+	catch
+		C:R:S ->
+			error_logger:error_msg("[csTabSrv] op=reload_key_lock table=~p key=~p reason=~0p~n", [Table, Key, {C, R, S}]),
+			{error, {LockKey, {C, R, S}}}
+	after
+		eGLock:releaseLock(LockKey)
+	end,
 	{reply, Result, State};
 handleCall(eStats, #state{table = Table, dbMod = DbMod, config = Config} = State, _From) ->
 	{reply, collectStats(Table, DbMod, Config), State};
@@ -209,14 +209,13 @@ doLoadWholeData(Table, DbMod, LoadFun) ->
 			runLoadFun(Table, Data, LoadFun)
 		catch C:R:S ->
 			error_logger:error_msg("[csTabSrv] op=load_whole_row table=~p key=~p reason=~0p~n", [Table, KeyValue, {C, R, S}]),
-			{error, {LockKey, {C, R, S}}}
+			throw({load_error, LockKey, {C, R, S}})
 		after
 			eGLock:releaseLock(LockKey)
 		end
-		  end,
+	end,
 	try DbMod:foreachRows(Table, [], 500, [], Fun) of
-		ok ->
-			ok;
+		ok -> ok;
 		{error, Err} ->
 			error_logger:error_msg("[csTabSrv] op=load_whole_table table=~p reason=~0p~n", [Table, Err]),
 			{error, Err}
@@ -237,15 +236,14 @@ doLoadAllKeys(Table, DbMod, LoadFun) ->
 			runLoadFun(Table, KeyValue, LoadFun)
 		catch C:R:S ->
 			error_logger:error_msg("[csTabSrv] op=load_hot_key table=~p key=~p reason=~0p~n", [Table, KeyValue, {C, R, S}]),
-			{error, {LockKey, {C, R, S}}}
+			throw({load_error, LockKey, {C, R, S}})
 		after
 			eGLock:releaseLock(LockKey)
 		end
-		  end,
+	end,
 	Opts = [{fields, PKeyFields}],
 	try DbMod:foreachRows(Table, [], 500, Opts, Fun) of
-		ok ->
-			ok;
+		ok -> ok;
 		{error, Err} ->
 			error_logger:error_msg("[csTabSrv] op=load_hot_keys table=~p reason=~0p~n", [Table, Err]),
 			{error, Err}
@@ -303,10 +301,10 @@ continueNext(SaveType, NextKey, Table, DbMod, StatusEts, KeysEts, PkField, Flush
 doSaveData(whole, DirtyKeys, Table, DbMod, StatusEts, _KeysEts, PkField, _FlushLimit, Ret, SaveCnt) ->
 	clearSaveErrors(),
 	{DataList, DelKeys, InsertRetryItems, DelRetryItems, FailCnt} = collWholeFlushItems(DirtyKeys, Table, StatusEts, [], [], [], [], 0),
-	
+
 	doDbBatch(Table, DelRetryItems, DbMod, batchDelByKey, [Table, PkField, DelKeys]),
 	doDbBatch(Table, InsertRetryItems, DbMod, batchInsert, [DataList, true]),
-	
+
 	SaveErrors = clearSaveErrors(),
 	SaveErrors /= [] andalso restoreSaveErrors(Table, StatusEts, SaveErrors),
 	NSaveCnt = SaveCnt + length(DirtyKeys) - FailCnt,
@@ -314,11 +312,11 @@ doSaveData(whole, DirtyKeys, Table, DbMod, StatusEts, _KeysEts, PkField, _FlushL
 doSaveData(_SaveType, DirtyKeys, Table, DbMod, StatusEts, KeysEts, PkField, _FlushLimit, Ret, SaveCnt) ->
 	clearSaveErrors(),
 	{Inserts, Updates, DelKeys, InsRetryItems, UpdRetryItems, DelRetryItems, FailCnt} = collDirtyFlushItems(DirtyKeys, Table, PkField, StatusEts, KeysEts, [], [], [], [], [], [], 0),
-	
+
 	doDbBatch(Table, InsRetryItems, DbMod, batchInsert, [Inserts, true]),
 	doDbBatch(Table, DelRetryItems, DbMod, batchDelByKey, [Table, PkField, DelKeys]),
 	doDbBatch(Table, UpdRetryItems, DbMod, batchUpdate, [Updates]),
-	
+
 	SaveErrors = clearSaveErrors(),
 	SaveErrors /= [] andalso restoreSaveErrors(Table, StatusEts, SaveErrors),
 	NSaveCnt = SaveCnt + length(DirtyKeys) - FailCnt,
@@ -481,25 +479,25 @@ doReloadKey(Table, Key, DbMod, Config) ->
 collectStats(Table, DbMod, Config) ->
 	DirtyTab = ?csDirtyTab(Table),
 	KeysTab = ?csKeysTab(Table),
-	
+
 	CacheSize = ets:info(Table, size),
 	DirtyCount = ets:info(DirtyTab, size),
 	KeysCount = ?CASE(KeysTab, undefined, 0, _, ets:info(KeysTab, size)),
-	
+
 	{NewCnt, UpCnt, DelCnt} = collDirtyCnt(DirtyTab),
-	
+
 	CacheMem = ets:info(Table, memory),
 	DirtyMem = ets:info(DirtyTab, memory),
 	KeysMem = ?CASE(KeysTab, undefined, 0, _, ets:info(KeysTab, memory)),
 	TotalMem = CacheMem + DirtyMem + KeysMem,
-	
+
 	LoadFun = Config#tbCache.loadFun,
 	Schema = DbMod:schema(Table),
-	
+
 	#{
 		%% --- 基础标识 ---
 		table => Table,
-		
+
 		%% --- 行数 ---
 		cacheSize => CacheSize,
 		dirtyCnt => DirtyCount,
@@ -507,12 +505,12 @@ collectStats(Table, DbMod, Config) ->
 		newCnt => NewCnt,
 		updateCnt => UpCnt,
 		delCnt => DelCnt,
-		
+
 		cacheMem => CacheMem,
 		dirtyMem => DirtyMem,
 		keysMem => KeysMem,
 		totalMem => TotalMem,
-		
+
 		%% --- 缓存配置 ---
 		cacheType => Config#tbCache.type,
 		saveMode => Config#tbCache.saveMode,
@@ -521,7 +519,7 @@ collectStats(Table, DbMod, Config) ->
 		flushLimit => Config#tbCache.flushLimit,
 		isOrder => Config#tbCache.isOrder,
 		loadFun => LoadFun,
-		
+
 		%% 表的格式
 		schema => Schema,
 		%% --- 抽样数据，便于调试 ---
@@ -585,17 +583,17 @@ clearCache(Table, ExpiredKeys, ExpiredTime) ->
 %%% ===================================================================
 doDbBatch(Table, RetryItems, DdMod, DbFun, DdArgs) ->
 	RetryItems /= [] andalso try apply(DdMod, DbFun, DdArgs) of
-								 ok ->
-									 ok;
-								 {ok, _Cnt} ->
-									 ok;
-								 {error, Reason} ->
-									 recordSaveError(Table, DbFun, RetryItems, Reason);
-								 Other ->
-									 recordSaveError(Table, DbFun, RetryItems, {unexpected_return, Other})
-							 catch C:R:S ->
+		ok ->
+			ok;
+		{ok, _Cnt} ->
+			ok;
+		{error, Reason} ->
+			recordSaveError(Table, DbFun, RetryItems, Reason);
+		Other ->
+			recordSaveError(Table, DbFun, RetryItems, {unexpected_return, Other})
+	catch C:R:S ->
 		recordSaveError(Table, DbFun, RetryItems, {C, R, S})
-							 end.
+	end.
 
 recordSaveError(Table, Op, RetryItems, Reason) ->
 	addSaveError(RetryItems),

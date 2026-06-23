@@ -1,21 +1,29 @@
 # eCas
 
-eCas 是面向 Erlang 游戏服的数据缓存与持久化中间件，基于 ETS、`eGLock`、`eMysql/ePgdb` 封装了一套“内存缓存 +
-定时落盘”的数据访问方案。应用层定义好 schema 和缓存策略后，就可以像操作内存数据一样读写业务数据，并把数据库加载、脏数据合并、批量落盘等细节交给
-eCas 处理。
+eCas 是面向 Erlang 游戏服的数据缓存与持久化中间件：业务只操作内存（ETS），脏数据由后台进程批量落盘到 MySQL/PostgreSQL。
+
+**一句话**：定义好 schema → `eCas:start/7` → 用 `get/create/insert/txn` 读写，不用手写 SQL。
+
+| 我想… | 看这里 |
+|--------|--------|
+| 5 分钟跑起来 | [快速上手](#快速上手) |
+| `create` 和 `insert` 啥区别 | [create 与 insert（必读）](#create-与-insert-必读) |
+| 多 key 事务怎么写 | [txn 事务](#txn-事务) |
+| 原理和流程图 | [docs/设计说明.md](docs/设计说明.md) |
+| 文档索引 | [docs/README.md](docs/README.md) |
 
 本文档以当前代码为准，主要参考 `src/eCas.erl`、`src/csTabSrv.erl`、`include/eCas.hrl`、`test/cacheTabDef.erl` 和测试用例。
 
 ## 目录
 
 - [快速上手](#快速上手)
+- [create 与 insert（必读）](#create-与-insert-必读)
 - [项目结构](#项目结构)
 - [核心概念](#核心概念)
 - [Schema 定义](#schema-定义)
 - [缓存参数与推荐](#缓存参数与推荐)
 - [API 参考](#api-参考)
 - [txn 事务](#txn-事务)
-- [设计原理](#设计原理)
 - [设计文档](#设计文档)
 - [测试与性能测试](#测试与性能测试)
 - [方案优缺点](#方案优缺点)
@@ -78,6 +86,25 @@ ok = eCas:stop().
 
 `create/2,3` 表示“插入全新业务数据”，不是创建 ETS 表。普通 ETS 表的生命周期由调用方负责。
 
+## create 与 insert（必读）
+
+eCas 的命名和常见 ORM **相反**，第一次用务必记住：
+
+| API | 语义 | 何时用 |
+|-----|------|--------|
+| `create/2,3` | **新建**一行，`DirtyState = new` | 主键尚不存在 |
+| `insert/2,3` | **更新**已有行，`DirtyState = update` | 主键已存在（或 whole 表覆盖写） |
+
+```erlang
+%% 第一次写入玩家 — 用 create
+ok = eCas:create(players, Player),
+
+%% 改等级 — 用 insert（不是 create）
+ok = eCas:insert(players, 10001, Player#{level => 2}).
+```
+
+多 key、需要回滚时用 `txn/3,4`，见 [txn 事务](#txn-事务)。
+
 ## 项目结构
 
 ```text
@@ -91,8 +118,8 @@ eCas/
 │   ├── csTabSrv.erl             # 缓存表进程：建 ETS、加载、flush、TTL、reload、stats
 │   └── eCas.erl              # 对外 API：CRUD、批量、txn、flush、reload、stats
 ├── docs/
-│   ├── 设计说明.md           # txn / 缓存设计补充说明
-│   └── batch-update-sql.md   # dirty 批量更新 SQL 说明
+│   ├── 设计说明.md           # 架构图、数据流、txn 语义
+│   └── README.md             # 文档导航
 ├── test/
 │   ├── cacheTabDef.erl          # 测试用缓存配置模块
 │   ├── dbSchemaDef.erl          # 测试用 DB schema 模块
@@ -263,7 +290,6 @@ create(Table, Key, Data) -> ok | {error, Reason}.
 insert(Table, Data) -> ok | {error, Reason}.
 insert(Table, Key, Data) -> ok | {error, Reason}.
 delete(Table, Key) -> ok | {error, Reason}.
-delete_return(Table, Key) -> {ok, Data} | {error, Reason}.
 take(Table, Key) -> {ok, Data} | {error, Reason}.
 keysDelete(Table, Key) -> ok.
 ```
@@ -292,7 +318,7 @@ mdelete(Table, Keys) -> ok | {error, Reason}.
 当前批量写接口走 `txn/3,4` 的缓存感知提交流程，不再直接复用 `eGLock:txn/4`。`minsert/2` 仅用于缓存表，
 普通 ETS 表必须使用带 `Key` 的 `create/3`、`insert/3` 或 `mput/2`。
 
-`mupdate/2` 用于局部字段更新：
+`mupdate/2` 用于局部字段更新，同样仅用于缓存表（普通 ETS 表会返回 `{error, not_cache_table}`）：
 
 ```erlang
 ok = eCas:mupdate(items, [
@@ -424,87 +450,24 @@ flush 幂等落盘。提交中途失败会按快照回退本次事务的所有 E
 - `Fun` 中 `throw` 的值会原样返回给调用方；此时尚未进入提交阶段，不会修改缓存。
 - 其他异常：`{error, {txn_error, {Class, Reason, Stack}}}`。
 
-## 设计原理
+## 设计文档
 
-### 启动加载
+原理、流程图、删除语义差异等详见：
 
-```text
-eCas:start/7
-    ├─ application:ensure_all_started(eCas)
-    ├─ DbMod:start/6
-    ├─ persistent_term:put(?csDbMod, DbMod)
-    └─ startCsTables(cacheTabDef:getCaches())
-         └─ eCas_sup:startTable(Table, StartInfo)
-              └─ csTabSrv:init/1
-                   ├─ createTabEts(Table, Config)
-                   ├─ maybeSaveTimer(Config)
-                   ├─ maybeTtlTimer(Config)
-                   └─ loadInitData(Table, DbMod, Config)
-```
+- [docs/README.md](docs/README.md) — 文档导航与阅读顺序
+- [docs/设计说明.md](docs/设计说明.md) — 架构图、读/写/落盘/txn 流程
 
-whole 表启动时通过 `DbMod:foreachRows/4` 全量加载数据到主 ETS。hotData 表启动时只投影主键字段，写入 Keys ETS。
+以下内容在 README 中保留简要版；细节以设计说明为准。
 
-### 读取路径
+### 启动与落盘（摘要）
 
 ```text
-get(Table, Key)
-    ├─ 普通 ETS
-    │   └─ ets:lookup(Table, Key)
-    └─ 缓存表
-        ├─ ets:lookup(Table, Key)
-        ├─ whole miss   -> not_found
-        └─ hotData miss -> Keys ETS 有 key -> DbMod:get -> 写主缓存
+eCas:start/7 → 每张缓存表一个 csTabSrv → 定时/主动 flush → DbMod 批量写库
 ```
 
-### 写入路径
-
-```text
-insert/create/txn alter
-    ├─ eGLock 锁定 {Table, Key}
-    ├─ 读取旧缓存状态
-    ├─ 写主表
-    ├─ hotData 必要时写 Keys ETS
-    └─ 写 Dirty ETS
-```
-
-对于 `saveType = dirty`，eCas 会比较旧数据和新数据，通过 `cacheTabDef:tableFields/1` 计算 `DirtyMask`。flush 时再把 bitmask
-转为字段列表传给 DB。
-
-### 删除路径
-
-hotData 删除：
-
-```text
-delete / txn '$delete'
-    ├─ ets:delete(Table, Key)
-    ├─ ets:delete(KeysTab, Key)
-    └─ Dirty ETS 写 {Key, del}
-```
-
-whole 表 `delete/2` 对已落盘数据会立即调用 `DbMod:delete/2`；但 txn 中 whole 删除改为延迟 dirty delete，避免 DB 副作用无法回滚。
-
-### 落盘路径
-
-```text
-csTabSrv:flushDirtyData/3
-    ├─ 从 Dirty ETS 取 dirty key，最多 flushLimit 条
-    ├─ 对每个 key 加 eGLock
-    ├─ 删除 Dirty ETS 中本轮 key
-    ├─ 根据 DirtyType 收集 insert/update/delete 批次
-    ├─ 调用 DbMod:batchInsert / batchUpdate / batchDelByKey
-    └─ 如果 DB 失败，将 retry item 合并回 Dirty ETS
-```
-
-当前失败恢复是进程内、ETS 级补偿。节点崩溃、VM kill、机器断电时仍可能丢失未落盘状态。
-
-### TTL 淘汰
-
-TTL 仅对 `hotData` 生效。定时器扫描主缓存，只有满足以下条件的行会被淘汰：
-
-- `AccessTime < Now - TTL`
-- `DirtyState == clean`
-
-淘汰只删除主缓存行，不删除 Keys ETS；下次读取时仍可按 key 从 DB 回源。
+- `saveMode` 单位是**毫秒**。
+- `flush/1` 异步；关键数据用 `flushSync/1` 并检查返回值。若 flush 过程中出现加锁失败或主缓存行消失等非 DB 异常，对应脏 key 会被从 Dirty ETS 移除且不再恢复。
+- 停服前建议 `flushSync/0`。
 
 ## 测试与性能测试
 
@@ -517,7 +480,7 @@ rebar3 eunit
 
 当前测试覆盖：
 
-- 基础 CRUD、plain ETS、`delete_return/take`。
+- 基础 CRUD、plain ETS、`take`。
 - whole/hotData 读写、DB 回源、dirty mask。
 - txn 参数、默认值、`noneTab`、提交、删除、回滚、错误校验。
 - `csTabSrv` 初始化、flush、失败恢复、`flushLimit`、reload dirty 冲突。
@@ -580,13 +543,6 @@ field_diff_bench:run_ecas().  %% 仅 eCas 实现
 field_diff_bench:run(#{iterations => 100000, change_count => 4}).
 ```
 
-## 设计文档
-
-更细的设计说明见：
-
-- [docs/设计说明.md](docs/设计说明.md) — txn 接口、AlterTab 语义、提交与回滚
-- [docs/batch-update-sql.md](docs/batch-update-sql.md) — dirty 批量更新 SQL 生成
-
 ## 方案优缺点
 
 ### 优点
@@ -606,6 +562,7 @@ field_diff_bench:run(#{iterations => 100000, change_count => 4}).
 | 风险            | 说明                                 | 建议                             |
 |---------------|------------------------------------|--------------------------------|
 | 崩溃丢脏数据        | Dirty ETS 和主缓存都是内存态，未落盘时 VM 崩溃会丢数据 | 关键表增加 WAL/dirty journal 或同步写策略 |
+| flush 异常丢脏 key | 加锁失败、主缓存行消失等非 DB 异常会导致脏 key 从 Dirty ETS 移除且不恢复 | 关键数据用 `flushSync/1` 并检查返回值；异常时人工介入 |
 | whole 大表内存高   | 全量加载可能导致启动慢或内存压力大                  | 大表优先用 hotData                  |
 | 单表落盘串行        | 每张缓存表一个 `csTabSrv`，flush 在单进程内组织批次 | 合理设置 `flushLimit`，必要时按业务拆表     |
 | 多节点不一致        | 当前无跨节点缓存失效/同步                      | 使用单写节点、广播失效或外部 L2 缓存           |

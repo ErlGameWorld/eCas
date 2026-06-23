@@ -217,6 +217,20 @@ flush_sync_delete_failure_restores_dirty_test() ->
 		teardown_srv(players)
 	end.
 
+flush_orphan_dirty_is_dropped_test() ->
+	setup_srv(items),
+	try
+		{ok, Pid} = csTabSrv:start_link(items),
+		unlink(Pid),
+		wait_until(fun() -> ets:info(items, name) =:= items end),
+		ets:insert(?csDirtyTab(items), {202, ?cs_update}),
+		ok = eCas:flushSync(items),
+		?assertEqual([], ets:lookup(?csDirtyTab(items), 202)),
+		?assertEqual([], ets:lookup(items, 202))
+	after
+		teardown_srv(items)
+	end.
+
 flush_limit_keeps_remaining_dirty_keys_test() ->
 	setup_srv(items),
 	try

@@ -19,7 +19,7 @@ start_link() ->
 	supervisor:start_link({local, ?SERVER}, ?MODULE, []).
 
 init([]) ->
-	SupFlags = #{strategy => one_for_one, intensity => 32, period => 100},
+	SupFlags = #{strategy => one_for_one, intensity => 10, period => 60},
 	{ok, {SupFlags, []}}.
 
 startTable(Table, StartInfo) ->
