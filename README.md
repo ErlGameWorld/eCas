@@ -70,7 +70,7 @@ eMysql,
 ).
 ```
 
-`PoolArgs` 中的 `wFCnt` 会被用作缓存表启动批次大小；未配置时默认使用 `max(1, erlang:system_info(schedulers) - 1)`。
+`PoolArgs` 中的 `wFCnt` 为数据库连接池数量；未配置时默认使用 `max(1, erlang:system_info(schedulers) - 1)`。
 
 ### 4. 使用缓存 API
 
